@@ -19,7 +19,7 @@ module Program
         
         def obj = newobj { 
             inherits: A with { 
-                ToString() = { x.ToString() + " - " + y.ToString() }
+                ToString() = { $"$x - $y" }
                 PrintString(p: string) = { y = "back to y"; Write("Overriden -> "); base.PrintString(p) }
             } 
             ICloneable: {
