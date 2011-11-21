@@ -1,0 +1,49 @@
+﻿using System;
+using System.Console;
+
+using ObjectExpressions;
+
+module Program
+{
+    public class A 
+    {
+        public virtual PrintString(p: string): void { WriteLine("A: " + p) }
+        public DoSomething(): void { WriteLine("Doing smth") }
+        public SomeProperty: double { get; set; }
+    }
+    
+    Main() : void
+    {
+        def x = 42;
+        mutable y = "y";
+        
+        def obj = newobj { 
+            inherits: A with { 
+                ToString() = { x.ToString() + " - " + y.ToString() }
+                PrintString(p: string) = { y = "back to y"; Write("Overriden -> "); base.PrintString(p) }
+            } 
+            ICloneable: {
+                Clone = { WriteLine("clone"); 1 }
+            }
+            IDisposable: { Dispose = { WriteLine("dispose") } }
+        };
+         
+        WriteLine(obj.ToString()); // use locals x & y
+        y = "y has changed"; // modify y
+        WriteLine(obj.ToString());
+        
+        // test property
+        obj.SomeProperty = 0.5;
+        WriteLine("Property: " + obj.SomeProperty.ToString());
+        
+        obj.DoSomething(); // call nonvirtual method
+        obj.PrintString("!!!"); // overriden method, that changes y
+        WriteLine("now y = " + y);
+        
+        // interface implementation
+        _ = obj.Clone();
+        obj.Dispose();
+        
+        _ = ReadLine();
+    }
+}

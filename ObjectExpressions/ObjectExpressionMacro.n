@@ -1,0 +1,297 @@
+﻿using Nemerle;
+using Nemerle.Collections;
+using Nemerle.Compiler;
+using Nemerle.Utility;
+
+using System;
+using System.Collections.Generic;
+
+using NA = Nemerle.Compiler.NemerleAttributes;
+using PT  = Nemerle.Compiler.Parsetree;
+using TT  = Nemerle.Compiler.Typedtree;
+using SCG = System.Collections.Generic;
+
+namespace ObjectExpressions
+{
+    public macro NewObjectExpression(body)
+    syntax("newobj", body)
+    {
+        NewObjectImpl.Run(Macros.ImplicitCTX(), body)
+    }
+    
+    /// Macro Implementation
+    internal module NewObjectImpl
+    {
+        #region Info Types
+        
+        /// New object can override the inherited members, implement some interface(s)
+        /// or declare the new 
+        variant DeclarationPart 
+        {
+            | Base { typeInfo : GeneralTypeInfo; }
+            | Interface { typeInfo : GeneralTypeInfo; }
+            | This { methods: list[MethodInfo]; }
+        }
+        
+        /// Type info is its declaration, generic args and methods
+        [Record]
+        class GeneralTypeInfo
+        {
+            [Accessor] private declaration : PT.PExpr.Ref;
+            [Accessor] private genericArgs : list[PT.PExpr];
+            [Accessor] private methods : list[MethodInfo];
+        }
+         
+        /// Method Info - the information about its name, parameters, implementation and return type
+        [Record]
+        class MethodInfo
+        {
+            [Accessor] private name : PT.Name;
+            [Accessor] private impl : PT.PExpr;
+            [Accessor] private parms : list[PT.PExpr];
+            [Accessor] private returnType : PT.PExpr;
+        }
+        
+        #endregion
+        
+        #region Generate Components
+        
+        /// Get reconstructed declaration
+        private GetReconstructedDecl(typeInfo : GeneralTypeInfo) : PT.PExpr
+        {
+            if (typeInfo.GenericArgs.Length == 0)
+                <[ $(typeInfo.Declaration) ]>
+            else
+                <[ $(typeInfo.Declaration)[..$(typeInfo.GenericArgs)] ]>
+        }
+        
+        /// Map methods
+        private MapMethodExpr(expr: PT.PExpr) : MethodInfo
+        {
+            | <[ $(n: name) = $body ]> // todo: get lambdas back
+            | <[ $(n: name)() = $body ]> => MethodInfo(n, body, null, null)
+            | <[ $(n: name)(..$(parms)) = $body ]> =>
+                MethodInfo(n, body, parms, null)
+            | _ => Message.FatalError("incorrect method declaration")
+        }
+
+        /// Get all implementations (base, interface members)
+        private GetImplementations(expr: PT.PExpr): list[DeclarationPart]
+        {
+            | <[({.. $body})]> => body.Map(fun(x)
+                {
+                    // inherited methods
+                    | <[ (inherits: $(tName) with { ..$(methods) }) ]> with genericArgs = [] => 
+                        //Message.Hint($"$tName: ..$(methods)");
+                        DeclarationPart.Base(GeneralTypeInfo(
+                            tName :> PT.PExpr.Ref, genericArgs, methods.Map(MapMethodExpr)));
+                    // interface methods
+                    | <[ $(tName)[..$(genericArgs)] : { ..$(methods) } ]>
+                    | <[ $(tName) : { ..$(methods) } ]> with genericArgs = [] =>
+                        DeclarationPart.Interface(GeneralTypeInfo(
+                            tName :> PT.PExpr.Ref, genericArgs, methods.Map(MapMethodExpr)));
+                    //todo: new methods
+                    | _ => Message.FatalError("incorrect interface definition")
+                })
+            | _ => Message.FatalError("incorrect object expression")
+        }
+
+        /// Create a class with given members
+        private CreateClass(typer: Typer, baseClass: PT.PExpr, interfaces: SCG.List[PT.PExpr], members: SCG.List[PT.ClassMember]): TypeBuilder
+        {
+            def className = Macros.NewSymbol("ObjectExpression");
+            def impls = interfaces;
+            when(baseClass != null)
+                impls.Insert(0, baseClass);
+            typer.Env.Define( <[ decl:
+                internal sealed class $(className.Id : usesite) : ..$(impls.AsList())
+                {
+                    ..$(members.AsList())
+                }]>);
+        }
+        
+        /// Get modifiers to override the given method
+        private GetMethodModifiers(method: IMethod) : Modifiers
+        {
+            match(method.Attributes)
+            {
+                | attr when attr %&& NA.Public => 
+                    Modifiers(NA.Public | NA.Override, [])
+                | attr when attr %&& NA.Internal => 
+                    Modifiers(NA.Internal | NA.Override, [])
+                | attr when attr %&& NA.Protected => 
+                    Modifiers(NA.Protected | NA.Override, [])
+                | _ => Message.FatalError($"modifiers match fails for $(method.Name)");
+            }
+        }
+        
+        /// Lookup for a base method modifiers 
+        private LookupForModifiers(typer: Typer, fixed: FixedType, mInfo: MethodInfo): (TypeVar * Modifiers)
+        {
+            if (mInfo.ReturnType == null) 
+            {
+                def baseMethod = fixed.TypeInfo.LookupMember(mInfo.Name.Id).Head :> IMethod;
+                
+                def modifiers = 
+                    if (fixed.IsInterface)
+                        Modifiers(NA.Public, []);
+                    else
+                        GetMethodModifiers(baseMethod);
+                (baseMethod.ReturnType, modifiers)
+            }
+            else 
+            {
+                (typer.BindFixedType(mInfo.ReturnType), Modifiers(NA.Public, []));
+            }
+        }
+            
+        /// Create a new method 
+        private CreateMethod(typer: Typer, fixed: FixedType, mInfo: MethodInfo) : PT.ClassMember.Function
+        {
+            def (returnType, modifiers) = LookupForModifiers(typer, fixed, mInfo); 
+            def parms = 
+                if (mInfo.Parms == null)
+                    []
+                else
+                    mInfo.Parms.Map(fun(p) {
+                        | <[ $(name: name ): $ty ]> =>
+                            <[ parameter: $(name : name): $(ty) ]>
+                        | _ => Message.FatalError($"incorrect parameter definition in $(mInfo.Name)") });
+            <[ decl:
+                    ..$(modifiers) $(mInfo.Name: name)(..$(parms)) : $(returnType: typed) {
+                        $(mInfo.Impl);
+                    } ]>;
+        };
+        
+        /// Generate the members for the local values (including ctor and its parameter values)
+        private GenerateMembersForLocals(locals: Map[PT.Name, LocalValue]) : (List[PT.ClassMember] * List[PT.PExpr])
+        {
+            def members = SCG.List();
+            def ctorParams = SCG.List();
+            def ctorParamValues = SCG.List();
+            def assigns = SCG.List();
+            
+            def nameIt(vName, prefix) { PT.Name(prefix + vName.ToString()) };
+            def generateParam(field) { <[ parameter: $(field.name) : $(field.ty) ]> };
+            def generateAssign(field, param) { <[ this.$(field.Name: usesite) = $(param.name.GetName(): name) ]> };
+            
+            locals.Iter(fun (vName, vValue) {
+                if(!vValue.IsMutable)
+                {
+                    // Create simple fields for immutable values
+                    def field = <[ decl: private $(vName: name): $(vValue.Type : typed); ]>;
+                    def param = generateParam(field);
+                    members.Add(field);
+                    assigns.Add(generateAssign(field, param));
+                    ctorParams.Add(param);
+                    ctorParamValues.Add(<[ $(vName: name) ]>);
+                }
+                else
+                {
+                    // For mutable values we need lambdas (to get/set value)
+                    // and corresponding class members (property and fields to store the lambdas)
+                    def (getterName, setterName) = (nameIt(vName, "_get_"), nameIt(vName, "_set_"));
+                    def [ getterField, setterField ] as propertyFields = [
+                        <[ decl: private $(getterName: name): void -> $(vValue.Type : typed); ]>,
+                        <[ decl: private $(setterName: name): $(vValue.Type : typed) -> void; ]>
+                    ];
+                    def [ getterParam, setterParam ] as propertyParams = propertyFields.Map(generateParam);
+                
+                    def lambdas = [
+                        <[ () => { $(vName: name) } ]>,   // getter
+                        <[ v => { $(vName: name) = v } ]> // setter
+                    ];
+                    
+                    def propertyAssigns = [ 
+                        generateAssign(getterField, getterParam), // assign for getter
+                        generateAssign(setterField, setterParam)  // assign for setter
+                    ];
+
+                    def property = <[ decl:
+                        private $(vName: name): $(vValue.Type : typed)
+                        {
+                            get { $(getterName: name)() }
+                            set { $(setterName: name)(value) }
+                        } ]>;
+
+                    members.Add(property);
+                    members.AddRange(propertyFields);
+                    
+                    assigns.AddRange(propertyAssigns);
+                    ctorParams.AddRange(propertyParams);  
+                    ctorParamValues.AddRange(lambdas);
+                }
+            });
+            
+            def ctor = <[decl: public this(..$(ctorParams.AsList())) {.. $(assigns.AsList())} ]>;
+            members.Add(ctor);   
+            (members, ctorParamValues)
+        }
+        
+        #endregion
+        
+        #region Macro Implementation
+        
+        public Run(typer: Typer, expr : PT.PExpr) : PT.PExpr
+        { 
+            def implementations = GetImplementations(expr);
+            def implementedInterfaces = SCG.List();
+
+            // find out the locals to make closure fields of
+            def locals = typer.LocalContext.GetLocals().Filter((_, value) => !(value.ValKind is LocalValue.Kind.BlockReturn));
+            // generate the corresponding members + constructor parameter values
+            def (members, ctorParamValues) = GenerateMembersForLocals(locals);
+            
+            def impl = match(implementations.Partition(i => i is DeclarationPart.Base))
+            {
+                | (classes, _) when (classes.Length > 1) => 
+                    Message.FatalError("Multiple inheritance is not supported");
+                | ([], rest) with baseInfo = null
+                | ([baseClass], rest) with baseInfo = (baseClass :> DeclarationPart.Base).typeInfo => 
+                    // gets PExpr for base class & adds overriden methods
+                    def baseClass =
+                        if (baseInfo == null) null;
+                        else {
+                            def fixed =
+                                GetReconstructedDecl(baseInfo)
+                                |> typer.BindFixedType;
+                            baseInfo.Methods.Iter(m => members.Add(CreateMethod(typer, fixed, m)));
+                            Macros.TypedChoose(fixed);
+                        }
+
+                   // check for the interface & user-defined methods
+                   rest.Iter(fun(_) {
+                        | DeclarationPart.Interface(ifc) =>
+                            def canUseDirectly = ifc.GenericArgs
+                                |> _.ForAll(fun(_){ | PT.PExpr.Wildcard => false | _ => true});
+                            unless(canUseDirectly)
+                                Message.FatalError("Inferred parameters and wildcards are not supported yet");
+                            
+                            def reconstructedDecl = GetReconstructedDecl(ifc);
+                            implementedInterfaces.Add(reconstructedDecl);
+                                
+                            foreach(m in ifc.Methods)
+                            {
+                                //Message.Hint($"Name: $(m.Name); Impl: $(m.Impl)");
+                                def ifcType = typer.BindFixedType(reconstructedDecl);
+                                members.Add(CreateMethod(typer, ifcType, m));
+                            }
+                        | DeclarationPart.This(methods) =>
+                            def names = methods.Map(m => m.Name);
+                            Message.FatalError($"Not implemented yet: $names");
+                        }
+                    );
+                    
+                   CreateClass(typer, baseClass, implementedInterfaces, members);
+            }
+            
+            unless(typer.InErrorMode)
+                impl.Compile();
+
+            //Message.Hint($"impl.FullName $(impl.FullName)");
+            <[$(impl.FullName : usesite)(..$(ctorParamValues.AsList()))]>
+        }
+        
+        #endregion
+    }
+}

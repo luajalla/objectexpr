@@ -1,0 +1,3 @@
+*Object Expression Macro* is inspired by [F# Object Expressions](http://msdn.microsoft.com/en-us/library/dd233237.aspx) and [existing macro](http://code.google.com/p/nemerle/source/browse/nemerle/trunk/snippets/ObjectExpressions/).
+
+This one is the first implementation, that allows to define the method body inside our macro using the values from local context (immutable and mutable ones). Generics and new members are not supported yet.
