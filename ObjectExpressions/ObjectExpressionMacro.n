@@ -41,7 +41,7 @@ namespace ObjectExpressions
             [Accessor] private genericArgs : list[PT.PExpr];
             [Accessor] private methods : list[MethodInfo];
         }
-         
+
         /// Method Info - the information about its name, parameters, implementation and return type
         [Record]
         class MethodInfo
@@ -50,6 +50,7 @@ namespace ObjectExpressions
             [Accessor] private impl : PT.PExpr;
             [Accessor] private parms : list[PT.PExpr];
             [Accessor] private returnType : PT.PExpr;
+            [Accessor] private localName: PT.Name;
         }
         
         #endregion
@@ -68,10 +69,11 @@ namespace ObjectExpressions
         /// Map methods
         private MapMethodExpr(expr: PT.PExpr) : MethodInfo
         {
-            | <[ $(n: name) = $body ]> // todo: get lambdas back
-            | <[ $(n: name)() = $body ]> => MethodInfo(n, body, null, null)
+            | <[ $(n: name) = $(localName: name) ]> with body = null
+            | <[ $(n: name) = $body ]> with localName = null
+            | <[ $(n: name)() = $body ]> with localName = null => MethodInfo(n, body, null, null, localName)
             | <[ $(n: name)(..$(parms)) = $body ]> =>
-                MethodInfo(n, body, parms, null)
+                MethodInfo(n, body, parms, null, null)
             | _ => Message.FatalError("incorrect method declaration")
         }
 
@@ -148,19 +150,38 @@ namespace ObjectExpressions
         /// Create a new method 
         private CreateMethod(typer: Typer, fixed: FixedType, mInfo: MethodInfo) : PT.ClassMember.Function
         {
-            def (returnType, modifiers) = LookupForModifiers(typer, fixed, mInfo); 
-            def parms = 
-                if (mInfo.Parms == null)
-                    []
-                else
-                    mInfo.Parms.Map(fun(p) {
-                        | <[ $(name: name ): $ty ]> =>
-                            <[ parameter: $(name : name): $(ty) ]>
-                        | _ => Message.FatalError($"incorrect parameter definition in $(mInfo.Name)") });
-            <[ decl:
-                    ..$(modifiers) $(mInfo.Name: name)(..$(parms)) : $(returnType: typed) {
-                        $(mInfo.Impl);
-                    } ]>;
+            // if method declared in form 'name = x' we try to find some local of function kind with the name 'x'
+            def local =
+                if (mInfo.LocalName != null)
+                    typer.LocalContext.FindLocal(mInfo.LocalName).Map(x => match (x.ValueKind) { 
+                        | LocalValue.Kind.Function(f, _) => f
+                    });
+                else null;
+
+            match(local)
+            {
+                // there is a local function with a required name, so the method implementation is just a call to it
+                | Some(f) =>
+                    <[decl:
+                        public $(mInfo.Name: name)(..$(f.ParametersDeclarations)): $(f.ReturnType : typed) {
+                            this.$(mInfo.LocalName: name)(..$(f.ParametersReferences))
+                        } ]>
+                // construct a complete method body
+                | _ =>
+                    def (returnType, modifiers) = LookupForModifiers(typer, fixed, mInfo);
+                    def parms =
+                        if (mInfo.Parms == null)
+                            []
+                        else
+                            mInfo.Parms.Map(fun(p) {
+                                | <[ $(name: name ): $ty ]> =>
+                                    <[ parameter: $(name : name): $(ty) ]>
+                                | _ => Message.FatalError($"incorrect parameter definition in $(mInfo.Name)") });
+                    <[ decl:
+                            ..$(modifiers) $(mInfo.Name: name)(..$(parms)) : $(returnType: typed) {
+                                $(mInfo.Impl);
+                            } ]>;
+            };
         };
         
         /// Generate the members for the local values (including ctor and its parameter values)

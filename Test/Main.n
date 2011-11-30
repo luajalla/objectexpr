@@ -3,6 +3,11 @@ using System.Console;
 
 using ObjectExpressions;
 
+public interface ITest
+{
+    Generate(): double
+}
+
 module Program
 {
     public class A 
@@ -11,9 +16,32 @@ module Program
         public DoSomething(): void { WriteLine("Doing smth") }
         public SomeProperty: double { get; set; }
     }
-    
+
+    private testFunRefs(): void
+    {
+        def generate() { 1.0; };
+
+        def obj = newobj {
+            ITest: {
+                Generate = 42.0
+            }
+        };
+
+        WriteLine($"Check member with a declared implementation: $(obj.Generate())");
+
+        def objWithLocalFun = newobj {
+            ITest: {
+                Generate = generate
+            }
+        };
+
+        WriteLine($"Check member referencing a local function: $(objWithLocalFun.Generate())");
+    }
+
     Main() : void
     {
+        testFunRefs();
+
         def x = 42;
         mutable y = "y";
         
